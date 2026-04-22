@@ -1,4 +1,15 @@
-import math
+#!/usr/bin/env python3
+"""
+Model export utility for Orbit Wars.
+Generates standalone main.py for Kaggle submission based on selected model.
+"""
+
+import argparse
+import sys
+import os
+
+# Template for main.py with placeholders
+MAIN_PY_TEMPLATE = '''import math
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 
 # Constants from game
@@ -23,6 +34,39 @@ def segment_hits_sun(x1, y1, x2, y2):
     t1, t2 = (-b - disc) / (2*a), (-b + disc) / (2*a)
     return (0 <= t1 <= 1) or (0 <= t2 <= 1)
 
+{agent_code}
+
+# Global agent instance
+_agent_instance = None
+
+def agent(obs, config=None):
+    global _agent_instance
+    try:
+        if hasattr(obs, 'player'):
+            player = obs.player
+        else:
+            player = obs.get("player", 0)
+
+        if _agent_instance is None:
+            _agent_instance = {agent_class_name}(player_id=player)
+        elif _agent_instance.player_id != player:
+            _agent_instance = {agent_class_name}(player_id=player)
+
+        return _agent_instance.compute_moves(obs)
+    except Exception as e:
+        # Return empty moves on any error
+        return []
+
+# For local testing
+if __name__ == "__main__":
+    print("{agent_name} agent loaded successfully")
+'''
+
+# Agent code templates
+AGENT_TEMPLATES = {
+    "heuristic": {
+        "class_name": "HeuristicAgent",
+        "agent_code": '''
 class HeuristicAgent:
     def __init__(self, player_id: int = 0):
         self.player_id = player_id
@@ -251,30 +295,102 @@ class HeuristicAgent:
             moves = moves[:10]
 
         return moves
+'''
+    },
+    "random": {
+        "class_name": "RandomAgent",
+        "agent_code": '''
+import random
 
+class RandomAgent:
+    def __init__(self, player_id: int = 0):
+        self.player_id = player_id
+        self.random = random.Random()
 
-# Global agent instance
-_agent_instance = None
-
-def agent(obs, config=None):
-    global _agent_instance
-
-    try:
+    def compute_moves(self, obs):
+        # Parse observation
         if hasattr(obs, 'player'):
             player = obs.player
+            raw_planets = obs.planets if obs.planets else []
         else:
             player = obs.get("player", 0)
+            raw_planets = obs.get("planets", [])
 
-        if _agent_instance is None:
-            _agent_instance = HeuristicAgent(player_id=player)
-        elif _agent_instance.player_id != player:
-            _agent_instance = HeuristicAgent(player_id=player)
+        planets = [Planet(*p) for p in raw_planets] if raw_planets else []
+        my_planets = [p for p in planets if p.owner == player]
+        if not my_planets:
+            return []
 
-        return _agent_instance.compute_moves(obs)
+        moves = []
+        # Random number of moves (0-2)
+        num_moves = self.random.randint(0, 2)
+        for _ in range(num_moves):
+            source = self.random.choice(my_planets)
+            if source.ships <= 1:
+                continue
+
+            # Random target (any planet except source)
+            target = self.random.choice([p for p in planets if p.id != source.id])
+            angle = math.atan2(target.y - source.y, target.x - source.x)
+            ships = self.random.randint(1, min(10, source.ships - 1))
+
+            moves.append([source.id, angle, ships])
+
+        return moves
+'''
+    }
+}
+
+def generate_main_py(model_type):
+    """Generate main.py content for given model type."""
+    if model_type not in AGENT_TEMPLATES:
+        raise ValueError(f"Unknown model type: {model_type}. Available: {list(AGENT_TEMPLATES.keys())}")
+
+    template = AGENT_TEMPLATES[model_type]
+    agent_code = template["agent_code"]
+    agent_class_name = template["class_name"]
+    agent_name = model_type.capitalize()
+
+    content = MAIN_PY_TEMPLATE.format(
+        agent_code=agent_code,
+        agent_class_name=agent_class_name,
+        agent_name=agent_name
+    )
+    return content
+
+def main():
+    parser = argparse.ArgumentParser(description='Export Orbit Wars model for Kaggle submission')
+    parser.add_argument('model', choices=['heuristic', 'random'],
+                       help='Model type to export')
+    parser.add_argument('--output', '-o', default='main.py',
+                       help='Output file path (default: main.py)')
+    parser.add_argument('--pack', '-p', action='store_true',
+                       help='Automatically run pack.py to create submission.zip')
+
+    args = parser.parse_args()
+
+    print(f"Generating {args.model} agent to {args.output}...")
+
+    try:
+        content = generate_main_py(args.model)
+        with open(args.output, 'w') as f:
+            f.write(content)
+        print(f"Successfully generated {args.output}")
+
+        if args.pack:
+            print("Running pack.py...")
+            import subprocess
+            result = subprocess.run([sys.executable, 'pack.py'],
+                                   capture_output=True, text=True)
+            if result.returncode == 0:
+                print("Successfully created submission.zip")
+            else:
+                print(f"pack.py failed: {result.stderr}")
+                sys.exit(1)
+
     except Exception as e:
-        # Return empty moves on any error
-        return []
+        print(f"Error: {e}")
+        sys.exit(1)
 
-# For local testing
 if __name__ == "__main__":
-    print("Heuristic agent loaded successfully")
+    main()

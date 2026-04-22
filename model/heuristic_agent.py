@@ -12,6 +12,28 @@ import logging
 from typing import List, Tuple, Dict, Optional
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 
+# Constants from game
+CENTER_X, CENTER_Y = 50.0, 50.0
+SUN_R = 10.0
+SAFETY = 1.3
+
+def segment_hits_sun(x1, y1, x2, y2):
+    """Check if line segment from (x1,y1) to (x2,y2) hits the sun."""
+    r = SUN_R + SAFETY
+    dx, dy = x2 - x1, y2 - y1
+    fx, fy = x1 - CENTER_X, y1 - CENTER_Y
+    a = dx*dx + dy*dy
+    if a < 1e-9:
+        return False
+    b = 2 * (fx*dx + fy*dy)
+    c = fx*fx + fy*fy - r*r
+    disc = b*b - 4*a*c
+    if disc < 0:
+        return False
+    disc = math.sqrt(disc)
+    t1, t2 = (-b - disc) / (2*a), (-b + disc) / (2*a)
+    return (0 <= t1 <= 1) or (0 <= t2 <= 1)
+
 # Set up logger
 logger = logging.getLogger(__name__)
 
@@ -163,9 +185,20 @@ class HeuristicAgent:
         player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
         raw_planets = obs.get("planets", []) if isinstance(obs, dict) else obs.planets
         raw_fleets = obs.get("fleets", []) if isinstance(obs, dict) else obs.fleets
+        # Ensure they are not None
+        if raw_planets is None:
+            raw_planets = []
+        if raw_fleets is None:
+            raw_fleets = []
         angular_velocity = obs.get("angular_velocity", 0) if isinstance(obs, dict) else obs.angular_velocity
+        if angular_velocity is None:
+            angular_velocity = 0
         initial_planets = obs.get("initial_planets", []) if isinstance(obs, dict) else obs.initial_planets
+        if initial_planets is None:
+            initial_planets = []
         comet_planet_ids = obs.get("comet_planet_ids", []) if isinstance(obs, dict) else obs.comet_planet_ids
+        if comet_planet_ids is None:
+            comet_planet_ids = []
 
         planets = [Planet(*p) for p in raw_planets]
         fleets = [Fleet(*f) for f in raw_fleets]
@@ -302,7 +335,7 @@ class HeuristicAgent:
 _agent_instance = None
 
 
-def heuristic_agent(obs):
+def heuristic_agent(obs, config=None):
     """
     Agent function compatible with Kaggle interface.
     """
@@ -316,4 +349,11 @@ def heuristic_agent(obs):
         # Player ID changed (shouldn't happen but just in case)
         _agent_instance = HeuristicAgent(player_id=player)
 
-    return _agent_instance.compute_moves(obs)
+    try:
+        return _agent_instance.compute_moves(obs)
+    except Exception as e:
+        # Log error to stderr (visible in Kaggle logs)
+        import sys
+        print(f"Heuristic agent error: {e}", file=sys.stderr)
+        # Return empty moves to avoid crashing validation
+        return []

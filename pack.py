@@ -22,3 +22,4 @@ with zipfile.ZipFile("submission.zip", mode="w", compression=zipfile.ZIP_DEFLATE
         zf.write(m)
 
     zf.write("./main.py")
+

@@ -60,7 +60,7 @@ class HeuristicAgent(BaseAgent):
         Returns:
             List of moves
         """
-        return heuristic_agent_fn(observation)
+        return heuristic_agent_fn(observation, None)
 
 
 class RandomAgent(BaseAgent):
