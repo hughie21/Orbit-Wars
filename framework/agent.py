@@ -6,6 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
 from model.heuristic_agent import heuristic_agent as heuristic_agent_fn
+from model.mcts_agent import MCTSAgent
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class RandomAgent(BaseAgent):
         super().__init__(player_id)
         self.name = "RandomAgent"
         import random
+
         self.random = random
 
     def act(self, observation: Dict) -> List[List]:
@@ -85,11 +87,21 @@ class RandomAgent(BaseAgent):
             Random moves (0-2 moves per turn)
         """
         import math
-        player = observation.get("player", 0) if isinstance(observation, dict) else observation.player
-        raw_planets = observation.get("planets", []) if isinstance(observation, dict) else observation.planets
+
+        player = (
+            observation.get("player", 0)
+            if isinstance(observation, dict)
+            else observation.player
+        )
+        raw_planets = (
+            observation.get("planets", [])
+            if isinstance(observation, dict)
+            else observation.planets
+        )
 
         # Parse planets
         from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
+
         planets = [Planet(*p) for p in raw_planets]
 
         # Get planets we own
@@ -120,7 +132,7 @@ def load_agent(agent_type: str = "heuristic", **kwargs) -> BaseAgent:
     Factory function to load an agent.
 
     Args:
-        agent_type: Type of agent ("heuristic", "random", etc.)
+        agent_type: Type of agent ("heuristic", "random", "mcts", etc.)
         **kwargs: Agent-specific arguments
 
     Returns:
@@ -132,5 +144,8 @@ def load_agent(agent_type: str = "heuristic", **kwargs) -> BaseAgent:
         return HeuristicAgent(**kwargs)
     elif agent_type == "random":
         return RandomAgent(**kwargs)
+    elif agent_type == "mcts":
+        return MCTSAgent(**kwargs)
     else:
         raise ValueError(f"Unknown agent type: {agent_type}")
+

@@ -19,20 +19,27 @@ from framework.trainer import Trainer
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Orbit Wars agent")
-    parser.add_argument("--agent", type=str, default="heuristic",
-                        help="Agent type (heuristic, random)")
-    parser.add_argument("--opponent", type=str, default="random",
-                        help="Opponent agent type")
-    parser.add_argument("--num_episodes", type=int, default=10,
-                        help="Number of training episodes")
-    parser.add_argument("--render_every", type=int, default=0,
-                        help="Render every N episodes (0 = never)")
-    parser.add_argument("--log_dir", type=str, default="./log",
-                        help="Log directory")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Verbose logging")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug mode")
+    parser.add_argument(
+        "--agent",
+        type=str,
+        default="heuristic",
+        help="Agent type (heuristic, random, MCTS)",
+    )
+    parser.add_argument(
+        "--opponent", type=str, default="random", help="Opponent agent type"
+    )
+    parser.add_argument(
+        "--num_episodes", type=int, default=10, help="Number of training episodes"
+    )
+    parser.add_argument(
+        "--render_every",
+        type=int,
+        default=0,
+        help="Render every N episodes (0 = never)",
+    )
+    parser.add_argument("--log_dir", type=str, default="./log", help="Log directory")
+    parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     return parser.parse_args()
 
 
@@ -46,7 +53,7 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         console=True,
         file=True,
-        log_prefix="train"
+        log_prefix="train",
     )
 
     logger.info("Starting Orbit Wars training")
@@ -90,6 +97,7 @@ def main():
 
     # Save results to file
     import json
+
     results_file = os.path.join(args.log_dir, "training_results.json")
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2)
@@ -100,3 +108,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

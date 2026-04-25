@@ -19,19 +19,25 @@ from framework.evaluator import Evaluator
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Orbit Wars agents")
-    parser.add_argument("--agents", type=str, nargs="+",
-                        default=["heuristic", "random"],
-                        help="Agent types to evaluate")
-    parser.add_argument("--num_episodes", type=int, default=20,
-                        help="Number of episodes per matchup")
-    parser.add_argument("--log_dir", type=str, default="./log",
-                        help="Log directory")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Verbose logging")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug mode")
-    parser.add_argument("--output", type=str, default="./eval_results.json",
-                        help="Output file for results")
+    parser.add_argument(
+        "--agents",
+        type=str,
+        nargs="+",
+        default=["heuristic", "random"],
+        help="Agent types to evaluate",
+    )
+    parser.add_argument(
+        "--num_episodes", type=int, default=20, help="Number of episodes per matchup"
+    )
+    parser.add_argument("--log_dir", type=str, default="./log", help="Log directory")
+    parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="./eval_results.json",
+        help="Output file for results",
+    )
     return parser.parse_args()
 
 
@@ -45,7 +51,7 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         console=True,
         file=True,
-        log_prefix="eval"
+        log_prefix="eval",
     )
 
     logger.info("Starting Orbit Wars evaluation")
@@ -103,6 +109,7 @@ def main():
 
     # Save results
     import json
+
     with open(args.output, "w") as f:
         json.dump(all_results, f, indent=2)
     logger.info(f"Results saved to {args.output}")
@@ -112,3 +119,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
