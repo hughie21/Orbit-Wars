@@ -64,7 +64,7 @@ def example_training():
 
     print(f"Training completed: {len(results)} episodes")
     for i, r in enumerate(results):
-        print(f"  Episode {i+1}: reward = {r['agent_reward']:.2f}")
+        print(f"  Episode {i + 1}: reward = {r['agent_reward']:.2f}")
     print()
 
 
@@ -115,6 +115,7 @@ def main():
     # Note: These examples require kaggle_environments to be installed
     try:
         from kaggle_environments import make
+
         example_basic()
         example_training()
         example_evaluation()
@@ -122,8 +123,12 @@ def main():
         print("All examples completed successfully!")
         print()
         print("Next steps:")
-        print("1. Run full training: python train.py --agent heuristic --num_episodes 100")
-        print("2. Evaluate agents: python test.py --agents heuristic random --num_episodes 50")
+        print(
+            "1. Run full training: python train.py --agent heuristic --num_episodes 100"
+        )
+        print(
+            "2. Evaluate agents: python test.py --agents heuristic random --num_episodes 50"
+        )
         print("3. Submit to Kaggle: kaggle competitions submit orbit-wars -f main.py")
 
     except ImportError as e:
@@ -137,3 +142,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

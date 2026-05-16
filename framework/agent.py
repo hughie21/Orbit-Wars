@@ -146,6 +146,9 @@ def load_agent(agent_type: str = "heuristic", **kwargs) -> BaseAgent:
         return RandomAgent(**kwargs)
     elif agent_type == "mcts":
         return MCTSAgent(**kwargs)
+    elif agent_type == "ppo":
+        from model.ppo_agent import PPOAgent
+        return PPOAgent(**kwargs)
     else:
         raise ValueError(f"Unknown agent type: {agent_type}")
 

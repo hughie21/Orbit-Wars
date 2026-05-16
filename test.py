@@ -24,7 +24,7 @@ def parse_args():
         type=str,
         nargs="+",
         default=["heuristic", "random"],
-        help="Agent types to evaluate",
+        help="Agent types to evaluate (heuristic, random, mcts, ppo)",
     )
     parser.add_argument(
         "--num_episodes", type=int, default=20, help="Number of episodes per matchup"
