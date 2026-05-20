@@ -16,6 +16,16 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 CENTER_X, CENTER_Y = 50.0, 50.0
 SUN_R = 10.0
 SAFETY = 1.3
+MAX_SPEED = 6.0
+ROTATION_LIMIT = 50.0
+
+def compute_speed(ships: int) -> float:
+    if ships <= 1:
+        return 1.0
+    return 1.0 + (MAX_SPEED - 1.0) * (math.log(ships) / math.log(1000)) ** 1.5
+
+def is_orbiting_planet(x: float, y: float, radius: float) -> bool:
+    return math.hypot(x - CENTER_X, y - CENTER_Y) + radius < ROTATION_LIMIT
 
 def segment_hits_sun(x1, y1, x2, y2):
     """Check if line segment from (x1,y1) to (x2,y2) hits the sun."""
@@ -63,39 +73,25 @@ class HeuristicAgent:
         return self.distance(p1.x, p1.y, p2.x, p2.y)
 
     def future_planet_position(self, planet: Planet, initial_planets, angular_velocity, steps: int = 10) -> Tuple[float, float]:
-        """
-        Predict planet position after `steps` turns for orbiting planets.
-        Simplified: assumes all orbiting planets rotate around center (50, 50).
-        """
-        # Find initial position from initial_planets
-        initial = None
-        for ip in initial_planets:
-            if ip[0] == planet.id:  # id matches
-                initial = ip
-                break
-
-        if initial is None:
-            return planet.x, planet.y
-
-        initial_x, initial_y = initial[2], initial[3]  # x, y
-        center_x, center_y = 50, 50
-
-        # Calculate radius from center
-        radius = math.sqrt((initial_x - center_x) ** 2 + (initial_y - center_y) ** 2)
-        if radius <= 0:
-            return planet.x, planet.y
-
-        # Initial angle
-        initial_angle = math.atan2(initial_y - center_y, initial_x - center_x)
-
-        # New angle after rotation
-        new_angle = initial_angle + angular_velocity * steps
-
-        # New position
-        new_x = center_x + radius * math.cos(new_angle)
-        new_y = center_y + radius * math.sin(new_angle)
-
-        return new_x, new_y
+        """Predict planet position after `steps` turns. Static planets return current position."""
+        if is_orbiting_planet(planet.x, planet.y, planet.radius):
+            # Find initial position for orbital radius
+            initial = None
+            for ip in initial_planets:
+                if ip[0] == planet.id:
+                    initial = ip
+                    break
+            if initial is None:
+                return planet.x, planet.y
+            init_x, init_y = initial[2], initial[3]
+            r = math.hypot(init_x - CENTER_X, init_y - CENTER_Y)
+            if r <= 1e-6 or angular_velocity == 0:
+                return planet.x, planet.y
+            # Use CURRENT angle, not initial angle
+            cur_angle = math.atan2(planet.y - CENTER_Y, planet.x - CENTER_X)
+            new_angle = cur_angle + angular_velocity * steps
+            return (CENTER_X + r * math.cos(new_angle), CENTER_Y + r * math.sin(new_angle))
+        return planet.x, planet.y  # static planet: position doesn't change
 
     def detect_incoming_threats(self, fleets: List[Fleet], my_planets: List[Planet]) -> Dict[int, List[Fleet]]:
         """
@@ -140,35 +136,25 @@ class HeuristicAgent:
         return leaving
 
     def choose_target_planet(self, planets: List[Planet], my_planets: List[Planet]) -> Optional[Planet]:
-        """
-        Choose target planet based on strategy 1:
-        - Prefer neutral planets with high production (3-5)
-        - Choose closest high-production neutral planet
-        """
+        """Choose best target: prefer static neutral high-prod planets using orbit penalty."""
         neutral_planets = [p for p in planets if p.owner == -1]
         high_prod = [p for p in neutral_planets if 3 <= p.production <= 5]
-
         if not high_prod:
-            # Fallback to any neutral planet
             high_prod = neutral_planets
-
         if not high_prod:
-            # No neutral planets, consider enemy planets
-            enemy_planets = [p for p in planets if p.owner != self.player_id and p.owner != -1]
-            high_prod = enemy_planets
-
+            high_prod = [p for p in planets if p.owner != self.player_id and p.owner != -1]
         if not high_prod:
             return None
 
-        # Find the closest high-production planet to any of our planets
         best_target = None
-        best_distance = float('inf')
+        best_score = float('inf')
 
         for target in high_prod:
             for my in my_planets:
-                dist = self.planet_distance(my, target)
-                if dist < best_distance:
-                    best_distance = dist
+                raw_dist = self.planet_distance(my, target)
+                score = raw_dist * (2.5 if is_orbiting_planet(target.x, target.y, target.radius) else 1.0)
+                if score < best_score:
+                    best_score = score
                     best_target = target
 
         return best_target
@@ -265,26 +251,32 @@ class HeuristicAgent:
 
                 if available_ships >= ships_needed:
                     # Strategy 5: Predict future position for orbiting planets
-                    if target.id not in self.comet_ids:  # Not a comet
-                        # Check if target is orbiting (close to center)
-                        center_dist = self.distance(target.x, target.y, 50, 50)
-                        if center_dist < 40:  # orbiting planet threshold
-                            # Predict position in 10 turns
-                            future_x, future_y = self.future_planet_position(
-                                target, initial_planets, angular_velocity, 10)
-                            # Adjust angle to future position
-                            angle = math.atan2(future_y - nearest_ally.y,
-                                              future_x - nearest_ally.x)
-                        else:
-                            angle = math.atan2(target.y - nearest_ally.y,
-                                              target.x - nearest_ally.x)
+                    if target.id not in self.comet_ids and is_orbiting_planet(target.x, target.y, target.radius):
+                        # Iterative convergence: aim → predict → re-aim
+                        speed = compute_speed(max(1, ships_needed))
+                        tx, ty = target.x, target.y
+                        for _ in range(5):
+                            fsteps = max(1, int(math.ceil(self.distance(nearest_ally.x, nearest_ally.y, tx, ty) / speed)))
+                            ptx, pty = self.future_planet_position(
+                                Planet(target.id, target.owner, tx, ty, target.radius, target.ships, target.production),
+                                initial_planets, angular_velocity, fsteps)
+                            if abs(ptx - tx) < 0.3 and abs(pty - ty) < 0.3:
+                                tx, ty = ptx, pty
+                                break
+                            tx, ty = ptx, pty
+                        angle = math.atan2(ty - nearest_ally.y, tx - nearest_ally.x)
                     else:
-                        # For comets, use current position (they move fast)
                         angle = math.atan2(target.y - nearest_ally.y,
                                           target.x - nearest_ally.x)
 
-                    moves.append([nearest_ally.id, angle, ships_needed])
-                    logger.info(f"Attack: sending {ships_needed} ships from {nearest_ally.id} to target {target.id}")
+                    # Sun-crossing check before launching
+                    lx = nearest_ally.x + math.cos(angle) * (nearest_ally.radius + 0.1)
+                    ly = nearest_ally.y + math.sin(angle) * (nearest_ally.radius + 0.1)
+                    hx = nearest_ally.x + math.cos(angle) * self.distance(nearest_ally.x, nearest_ally.y, target.x, target.y)
+                    hy = nearest_ally.y + math.sin(angle) * self.distance(nearest_ally.x, nearest_ally.y, target.x, target.y)
+                    if not segment_hits_sun(lx, ly, hx, hy):
+                        moves.append([nearest_ally.id, angle, ships_needed])
+                        logger.info(f"Attack: sending {ships_needed} ships from {nearest_ally.id} to target {target.id}")
 
         # Strategy 4: Comet utilization
         comet_planets = [p for p in planets if p.id in self.comet_ids]

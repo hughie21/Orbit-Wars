@@ -51,21 +51,82 @@ def segment_hits_sun(x1: float, y1: float, x2: float, y2: float) -> bool:
     return (0.0 <= t1 <= 1.0) or (0.0 <= t2 <= 1.0)
 
 
+def is_orbiting_planet(x: float, y: float, radius: float) -> bool:
+    """参考实现: 行星中心距 + 半径 < 50 才是轨道行星（会绕日运动）。"""
+    return math.hypot(x - CENTER_X, y - CENTER_Y) + radius < 50.0
+
+
 def predict_future_position_from_current(
     x: float,
     y: float,
     angular_velocity: float,
     steps: int,
 ) -> Tuple[float, float]:
-    radius = math.hypot(x - CENTER_X, y - CENTER_Y)
-    if radius < 1e-6 or angular_velocity == 0:
+    r = math.hypot(x - CENTER_X, y - CENTER_Y)
+    if r < 1e-6 or angular_velocity == 0 or steps <= 0:
         return x, y
     angle = math.atan2(y - CENTER_Y, x - CENTER_X)
     new_angle = angle + angular_velocity * steps
     return (
-        CENTER_X + radius * math.cos(new_angle),
-        CENTER_Y + radius * math.sin(new_angle),
+        CENTER_X + r * math.cos(new_angle),
+        CENTER_Y + r * math.sin(new_angle),
     )
+
+
+def compute_aim_angle(
+    src_x: float,
+    src_y: float,
+    target: "SimPlanet",
+    ships: int,
+    angular_velocity: float,
+    max_iterations: int = 5,
+) -> Tuple[float, float, float, int]:
+    """迭代收敛计算瞄准角 —— 参考 aim_with_prediction。
+
+    对确定的飞船数量迭代"估计到达 → 预测位置 → 重新估计"，
+    直到目标位置和到达轮数稳定（<0.3单位 且 轮数差≤1），
+    返回 (angle, predicted_x, predicted_y, flight_turns)。
+    """
+    speed = compute_speed(max(1, ships))
+    tx, ty = target.x, target.y
+    tr = getattr(target, "radius", 2.0)
+
+    for _ in range(max_iterations):
+        # 估算到达：圆心到圆心距离，忽略半径（简化版）
+        raw_dist = dist(src_x, src_y, tx, ty)
+        if raw_dist < 1e-6:
+            return math.atan2(ty - src_y, tx - src_x), tx, ty, 0
+
+        # 参考实现用 ceil，确保飞行轮数保守估计
+        turns = max(1, int(math.ceil(raw_dist / speed)))
+
+        if not is_orbiting_planet(tx, ty, tr):
+            # 静态行星：位置不变，直接算角度
+            angle = math.atan2(ty - src_y, tx - src_x)
+            return angle, tx, ty, turns
+
+        # 预测目标在 turns 轮后的位置
+        ptx, pty = predict_future_position_from_current(
+            tx,
+            ty,
+            angular_velocity,
+            turns,
+        )
+
+        # 检查是否收敛
+        new_raw_dist = dist(src_x, src_y, ptx, pty)
+        new_turns = max(1, int(math.ceil(new_raw_dist / speed)))
+
+        if abs(ptx - tx) < 0.3 and abs(pty - ty) < 0.3 and abs(new_turns - turns) <= 1:
+            angle = math.atan2(pty - src_y, ptx - src_x)
+            return angle, ptx, pty, new_turns
+
+        # 未收敛，用预测位置继续迭代
+        tx, ty = ptx, pty
+
+    # 迭代结束后返回最后一次估计
+    angle = math.atan2(ty - src_y, tx - src_x)
+    return angle, tx, ty, turns
 
 
 # ---------------------------------------------------------------------------
@@ -434,25 +495,33 @@ def generate_candidate_moves(
             continue
 
         # 候选目标：非己方行星（包括中立）
-        # 排序时对轨道行星（center_dist < 50）加 2.5 倍距离惩罚，
+        # 排序时对轨道行星加 2.5 倍距离惩罚，
         # 优先选择容易占领的外围静态行星，避免浪费舰队
         targets = sorted(
             [t for t in state.planets.values() if t.owner != my_id],
-            key=lambda t: dist(p.x, p.y, t.x, t.y)
-            * (
-                2.5
-                if (math.hypot(t.x - CENTER_X, t.y - CENTER_Y) < 50 and not t.is_comet)
-                else 1.0
+            key=lambda t: (
+                dist(p.x, p.y, t.x, t.y)
+                * (
+                    2.5
+                    if (
+                        is_orbiting_planet(t.x, t.y, getattr(t, "radius", 2.0))
+                        and not t.is_comet
+                    )
+                    else 1.0
+                )
             ),
         )
         if not targets:
             continue  # 无目标则跳过
 
         for target in targets[:CANDIDATES_PER_PLANET]:
-            center_dist = math.hypot(target.x - CENTER_X, target.y - CENTER_Y)
-            is_orbiting = center_dist < 50 and not target.is_comet
+            orbiting = (
+                is_orbiting_planet(target.x, target.y, getattr(target, "radius", 2.0))
+                and not target.is_comet
+            )
 
             # 估算到达时间，用于计算目标增援和选取发射飞船数量
+            # 参考实现：ceil(distance / speed) 保守估计飞行轮数
             est_distance = dist(p.x, p.y, target.x, target.y)
             est_travel_time = est_distance / compute_speed(max(1, p.ships // 2))
 
@@ -472,21 +541,28 @@ def generate_candidate_moves(
                 if not (1 <= ships <= p.ships - 3):
                     continue
 
-                if is_orbiting:
-                    # 根据实际飞船数量和距离计算飞行时间，
-                    # 然后预测目标在此时间后的位置，实现精确拦截
-                    speed = compute_speed(int(ships))
-                    flight_steps = max(1, int(est_distance / speed))
-                    fx, fy = predict_future_position_from_current(
-                        target.x,
-                        target.y,
-                        angular_velocity,
-                        flight_steps,
-                    )
-                else:
-                    fx, fy = target.x, target.y
+                # 迭代收敛瞄准：自动处理轨道/静态行星
+                angle, fx, fy, flight_turns = compute_aim_angle(
+                    p.x,
+                    p.y,
+                    target,
+                    int(ships),
+                    angular_velocity,
+                )
 
-                angle = math.atan2(fy - p.y, fx - p.x)
+                # 太阳安全检查：拒绝穿越太阳的路径
+                launch_dx = math.cos(angle) * (p.radius + 0.1)
+                launch_dy = math.sin(angle) * (p.radius + 0.1)
+                hit_dx = math.cos(angle) * dist(p.x, p.y, fx, fy)
+                hit_dy = math.sin(angle) * dist(p.x, p.y, fx, fy)
+                if segment_hits_sun(
+                    p.x + launch_dx,
+                    p.y + launch_dy,
+                    p.x + hit_dx,
+                    p.y + hit_dy,
+                ):
+                    continue
+
                 candidates.append((p.id, angle, int(ships)))
 
     return candidates
@@ -508,12 +584,16 @@ def generate_action_sets(
                 continue
             targets = sorted(
                 [t for t in state.planets.values() if t.owner != state.player],
-                key=lambda t: dist(p.x, p.y, t.x, t.y)
-                * (
-                    2.5
-                    if (math.hypot(t.x - CENTER_X, t.y - CENTER_Y) < 50
-                        and not getattr(t, "is_comet", False))
-                    else 1.0
+                key=lambda t: (
+                    dist(p.x, p.y, t.x, t.y)
+                    * (
+                        2.5
+                        if (
+                            math.hypot(t.x - CENTER_X, t.y - CENTER_Y) < 50
+                            and not getattr(t, "is_comet", False)
+                        )
+                        else 1.0
+                    )
                 ),
             )
             if targets:
@@ -561,32 +641,30 @@ def heuristic_opponent(pid: int, state: SimState) -> List[Tuple[int, float, int]
             continue
         targets = sorted(
             [t for t in state.planets.values() if t.owner != pid],
-            key=lambda t: dist(p.x, p.y, t.x, t.y)
-            * (
-                2.5
-                if (math.hypot(t.x - CENTER_X, t.y - CENTER_Y) < 50 and not getattr(t, "is_comet", False))
-                else 1.0
+            key=lambda t: (
+                dist(p.x, p.y, t.x, t.y)
+                * (
+                    2.5
+                    if (
+                        is_orbiting_planet(t.x, t.y, getattr(t, "radius", 2.0))
+                        and not getattr(t, "is_comet", False)
+                    )
+                    else 1.0
+                )
             ),
         )
         if not targets:
             continue
         target = targets[0]
-        # 对轨道行星做位置预测
-        center_dist = math.hypot(target.x - CENTER_X, target.y - CENTER_Y)
-        if center_dist < 50 and not getattr(target, "is_comet", False):
-            est_speed = compute_speed(max(1, p.ships))
-            flight_steps = max(1, int(dist(p.x, p.y, target.x, target.y) / est_speed))
-            fx, fy = predict_future_position_from_current(
-                target.x,
-                target.y,
-                state.angular_velocity,
-                flight_steps,
-            )
-        else:
-            fx, fy = target.x, target.y
-        angle = math.atan2(fy - p.y, fx - p.x)
         sent = min(target.ships + 1, available)
         if sent > 0:
+            angle, _, _, _ = compute_aim_angle(
+                p.x,
+                p.y,
+                target,
+                int(sent),
+                state.angular_velocity,
+            )
             moves.append((p.id, angle, int(sent)))
     return moves
 
@@ -603,33 +681,29 @@ def rollout_attack_policy(pid: int, state: SimState) -> List[Tuple[int, float, i
             continue
         targets = sorted(
             [t for t in state.planets.values() if t.owner != pid],
-            key=lambda t: dist(p.x, p.y, t.x, t.y)
-            * (
-                2.5
-                if (math.hypot(t.x - CENTER_X, t.y - CENTER_Y) < 50 and not getattr(t, "is_comet", False))
-                else 1.0
+            key=lambda t: (
+                dist(p.x, p.y, t.x, t.y)
+                * (
+                    2.5
+                    if (
+                        is_orbiting_planet(t.x, t.y, getattr(t, "radius", 2.0))
+                        and not getattr(t, "is_comet", False)
+                    )
+                    else 1.0
+                )
             ),
         )
         if targets:
             target = targets[0]
-            # 对轨道行星做位置预测
-            center_dist = math.hypot(target.x - CENTER_X, target.y - CENTER_Y)
-            if center_dist < 50 and not getattr(target, "is_comet", False):
-                est_speed = compute_speed(max(1, p.ships))
-                flight_steps = max(
-                    1, int(dist(p.x, p.y, target.x, target.y) / est_speed)
-                )
-                fx, fy = predict_future_position_from_current(
-                    target.x,
-                    target.y,
-                    state.angular_velocity,
-                    flight_steps,
-                )
-            else:
-                fx, fy = target.x, target.y
-            angle = math.atan2(fy - p.y, fx - p.x)
             sent = min(target.ships + 1, p.ships - 3)
             if sent > 0:
+                angle, _, _, _ = compute_aim_angle(
+                    p.x,
+                    p.y,
+                    target,
+                    int(sent),
+                    state.angular_velocity,
+                )
                 moves.append((p.id, angle, sent))
     return moves
 
@@ -727,36 +801,36 @@ class MCTSAgent:
 
     def act(self, observation) -> List[List]:
         self.turn += 1
-        print(f"=== Turn {self.turn} ===")  # 调试信息：输出回合数
+        # print(f"=== Turn {self.turn} ===")  # 调试信息：输出回合数
 
         try:
             state = SimState.from_observation(observation)
             self._cache_obs(observation)
 
             my_planets = state.my_planets()
-            print(f"My planets count: {len(my_planets)}")  # 调试信息：己方行星数
+            # print(f"My planets count: {len(my_planets)}")  # 调试信息：己方行星数
             if not my_planets:
-                print("No owned planets, return empty moves")
+                # print("No owned planets, return empty moves")
                 return []
 
             # 输出己方行星的飞船数
-            for p in my_planets:
-                print(f"Planet {p.id}: ships={p.ships}, owner={p.owner}")
+            # for p in my_planets:
+            # print(f"Planet {p.id}: ships={p.ships}, owner={p.owner}")
 
             best_action_set = self._mcts_search(state)
 
             if best_action_set is None:
-                print("No best action set found")
+                # print("No best action set found")
                 return []
 
-            print(f"Selected action set: {best_action_set}")  # 调试信息：输出选中的动作
+            # print(f"Selected action set: {best_action_set}")  # 调试信息：输出选中的动作
             return [list(m) for m in best_action_set]
 
         except Exception as e:
             # 修复：异常信息输出到stdout（Kaggle可见）
             import sys
 
-            print(f"MCTS agent error (turn {self.turn}): {e}", file=sys.stdout)
+            # print(f"MCTS agent error (turn {self.turn}): {e}", file=sys.stdout)
             import traceback
 
             traceback.print_exc(file=sys.stdout)
@@ -816,7 +890,7 @@ class MCTSAgent:
 
             iteration += 1
 
-        print(f"MCTS iterations: {iteration}")  # 调试信息：输出迭代次数
+        # print(f"MCTS iterations: {iteration}")  # 调试信息：输出迭代次数
         if not root.children:
             print("No MCTS children nodes")
             return None

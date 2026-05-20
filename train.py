@@ -58,6 +58,26 @@ def parse_args():
         "--save_dir", type=str, default="./checkpoints",
         help="Directory for model checkpoints"
     )
+    parser.add_argument(
+        "--load", type=str, default=None,
+        help="Path to a checkpoint .pt file to resume training from"
+    )
+    parser.add_argument(
+        "--opponent_mix", type=str, default=None,
+        help="Secondary opponent type for mixing (e.g., 'random' to mix with main opponent)"
+    )
+    parser.add_argument(
+        "--opponent_mix_ratio", type=float, default=0.3,
+        help="Probability of using the mix opponent (0.0-1.0, default 0.3)"
+    )
+    parser.add_argument(
+        "--ppo_target_kl", type=float, default=0.02,
+        help="Target KL divergence for early stopping (lower = more conservative updates)"
+    )
+    parser.add_argument(
+        "--reset_value_head", action="store_true",
+        help="Reset value head when loading checkpoint (use when switching opponent type)"
+    )
     return parser.parse_args()
 
 
@@ -82,8 +102,26 @@ def main():
     logger.info("Environment created")
 
     # Create agents
-    agent = load_agent(args.agent)
+    agent_kwargs = {}
+    if args.load and args.agent == "ppo":
+        agent_kwargs["load_path"] = args.load
+        logger.info(f"Loading model from: {args.load}")
+    agent = load_agent(args.agent, **agent_kwargs)
     opponent = load_agent(args.opponent)
+
+    # Opponent mixing: secondary opponent for curriculum training
+    opponent_mix = None
+    if args.opponent_mix:
+        opponent_mix = load_agent(args.opponent_mix)
+        logger.info(f"Mix opponent: {opponent_mix.name} (ratio={args.opponent_mix_ratio})")
+
+    # Reset value head when switching opponent types (prevents death spiral)
+    if args.reset_value_head and args.load and args.agent == "ppo":
+        agent.reset_value_head()
+        logger.info("Value head reset (--reset_value_head)")
+        # Also reset optimizer state for the value head
+        if args.ppo_lr:
+            logger.info(f"Using fine-tune LR: {args.ppo_lr}")
 
     logger.info(f"Main agent: {agent.name}")
     logger.info(f"Opponent agent: {opponent.name}")
@@ -92,12 +130,23 @@ def main():
     if args.agent == "ppo" and args.ppo_train:
         from model.ppo_agent import PPOTrainer
 
+        # Build opponent list and probability weights for mixing
+        if opponent_mix:
+            opponents = [opponent, opponent_mix]
+            probs = [1.0 - args.opponent_mix_ratio, args.opponent_mix_ratio]
+            logger.info(f"Opponent mix: {opponent.name}({probs[0]:.0%}) + {opponent_mix.name}({probs[1]:.0%})")
+        else:
+            opponents = [opponent]
+            probs = None
+
         trainer = PPOTrainer(
             env=env,
             agent=agent,
-            opponent_agents=[opponent],
+            opponent_agents=opponents,
+            opponent_probs=probs,
             lr=args.ppo_lr,
             update_epochs=args.ppo_epochs,
+            target_kl=args.ppo_target_kl,
             log_dir=args.log_dir,
         )
         results = trainer.train(

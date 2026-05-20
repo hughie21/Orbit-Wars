@@ -37,23 +37,25 @@ MAX_PLANETS = 40
 MAX_FLEETS = 80
 MAX_SHIPS = 1000
 BOARD_SIZE = 100.0
-PP_FEAT_DIM = 8    # x, y, radius, ships, production, owner_proxy, is_mine, center_dist
+# Planet features: raw 8 + reaction(3) + static/comet(2) + indirect(3) + threat(1) + is_enemy(1) = 18
+PP_FEAT_DIM = 18
 FL_FEAT_DIM = 6    # x, y, sin(angle), cos(angle), ships, is_mine
-GLOBAL_DIM = 11
+# Global features: raw 11 + domination(1) + modes(3) + total_threat(1) = 16
+GLOBAL_DIM = 16
 STATE_DIM = MAX_PLANETS * PP_FEAT_DIM + MAX_FLEETS * FL_FEAT_DIM + GLOBAL_DIM
-N_RATIOS = 5
-N_ACTIONS = 3       # number of parallel moves per turn
+N_RATIOS = 8
+N_ACTIONS = 5       # number of parallel moves per turn
 
 # PPO defaults
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
 VF_COEF = 0.5
-ENT_COEF = 0.02
-LR = 3e-4
-UPDATE_EPOCHS = 8
+ENT_COEF = 0.03
+LR = 2e-4
+UPDATE_EPOCHS = 10
 BATCH_SIZE = 256
-MAX_GRAD_NORM = 0.5
+MAX_GRAD_NORM = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -61,14 +63,14 @@ MAX_GRAD_NORM = 0.5
 # ---------------------------------------------------------------------------
 
 def compute_shaped_reward(obs_before: Dict, obs_after: Dict, player: int,
-                          terminal_done: bool = False) -> float:
+                          terminal_reward: float = 0.0) -> float:
     """Compute intermediate reward from game state change.
 
-    Returns the difference in a composite score between consecutive states,
-    scaled to a reasonable range for PPO training.
+    Combines a state-value delta with explicit capture/loss bonuses and
+    the terminal game outcome so PPO receives informative per-step signals.
     """
     if obs_before is None or obs_after is None:
-        return 0.0
+        return terminal_reward
 
     try:
         pb = obs_before.get("planets", []) if isinstance(obs_before, dict) else getattr(obs_before, "planets", []) or []
@@ -76,28 +78,134 @@ def compute_shaped_reward(obs_before: Dict, obs_after: Dict, player: int,
         fb = obs_before.get("fleets", []) if isinstance(obs_before, dict) else getattr(obs_before, "fleets", []) or []
         fa = obs_after.get("fleets", []) if isinstance(obs_after, dict) else getattr(obs_after, "fleets", []) or []
 
+        # Build lookup tables keyed by planet id
+        pb_map = {p[0]: p for p in pb}
+        pa_map = {p[0]: p for p in pa}
+
+        # --- planet capture / loss bonus (large, sparse) ---
+        cap_bonus = 0.0
+        for pid, pa_planet in pa_map.items():
+            pb_planet = pb_map.get(pid)
+            if pb_planet is None:
+                continue
+            was_mine = pb_planet[1] == player
+            is_mine = pa_planet[1] == player
+            was_enemy = pb_planet[1] not in (-1, player)
+            is_enemy = pa_planet[1] not in (-1, player)
+            if not was_mine and is_mine:
+                cap_bonus += 1.0 + pa_planet[6] * 0.3    # captured! reward production
+            elif was_mine and not is_mine:
+                cap_bonus -= 1.0 + pb_planet[6] * 0.3    # lost planet
+            elif was_enemy and not is_enemy:
+                cap_bonus += 0.3                           # enemy lost a planet (neutralised)
+
+        # --- continuous score (equal weight on garrison & fleet — no launch penalty) ---
         def score(planets, fleets, player):
             s = 0.0
             for p in planets:
-                pid, owner, x, y, radius, ships, prod = p[:7]
+                _, owner, _, _, _, ships, prod = p[:7]
                 if owner == player:
-                    s += ships * 0.5          # garrison ships
-                    s += prod * 3.0           # production
-                    s += 5.0                  # planet control bonus
+                    s += ships * 1.0
+                    s += prod * 5.0
+                    s += 10.0                 # planet control
             for f in fleets:
-                fid, owner, x, y, angle, from_pid, ships = f[:7]
+                _, owner, _, _, _, _, ships = f[:7]
                 if owner == player:
-                    s += ships * 0.3          # fleet ships (less than garrison — they're in transit)
+                    s += ships * 1.0          # fleet ships equal to garrison ships
             return s
 
         score_before = score(pb, fb, player)
         score_after = score(pa, fa, player)
+        delta = (score_after - score_before) / 10.0
 
-        # Scale to [-1, 1] range approximately
-        delta = (score_after - score_before) / 50.0
-        return max(-1.0, min(1.0, delta))
+        # Fleet loss penalty: ships lost without gaining planets (sun/edge/failed attacks)
+        my_fleet_before = sum(f[6] for f in fb if f[1] == player)
+        my_fleet_after = sum(f[6] for f in fa if f[1] == player)
+        fleet_loss = my_fleet_before - my_fleet_after
+        gained_planets = sum(1 for pid, pa_p in pa_map.items()
+                             if pb_map.get(pid) and pb_map[pid][1] != player and pa_p[1] == player)
+        fleet_penalty = fleet_loss * 0.01 if fleet_loss > 0 and gained_planets == 0 else 0.0
+
+        reward = delta + cap_bonus + terminal_reward - fleet_penalty
+        return max(-2.0, min(2.0, reward))
     except Exception:
-        return 0.0
+        return terminal_reward
+
+
+# ---------------------------------------------------------------------------
+# Strategic feature extraction (from WorldModel approach)
+# ---------------------------------------------------------------------------
+
+def _fleet_speed(ships: int) -> float:
+    if ships <= 1:
+        return 1.0
+    ratio = math.log(ships) / math.log(1000)
+    ratio = max(0.0, min(1.0, ratio))
+    return 1.0 + 5.0 * (ratio ** 1.5)
+
+
+def _is_static_planet(x: float, y: float, radius: float) -> bool:
+    return math.hypot(x - 50.0, y - 50.0) + radius >= 50.0
+
+
+def _estimate_travel_turns(sx, sy, tx, ty, ships):
+    d = math.hypot(tx - sx, ty - sy)
+    return max(1, int(math.ceil(d / _fleet_speed(max(1, ships)))))
+
+
+def _compute_reaction_times(planets, my_planets, enemy_planets):
+    """For each planet, compute the minimum turns until my / enemy forces can arrive."""
+    my_times = {}
+    enemy_times = {}
+    for p in planets:
+        pid, px, py = p[0], p[2], p[3]
+        mt = 999
+        for mp in my_planets:
+            mt = min(mt, _estimate_travel_turns(mp[2], mp[3], px, py, max(1, mp[5] // 3)))
+        my_times[pid] = mt
+
+        et = 999
+        for ep in enemy_planets:
+            et = min(et, _estimate_travel_turns(ep[2], ep[3], px, py, max(1, ep[5] // 3)))
+        enemy_times[pid] = et
+    return my_times, enemy_times
+
+
+def _compute_indirect_influence(planet, all_planets, player):
+    """Friendly / neutral / enemy production influence weighted by distance."""
+    px, py = planet[2], planet[3]
+    friendly = neutral = enemy = 0.0
+    for other in all_planets:
+        if other[0] == planet[0]:
+            continue
+        d = math.hypot(other[2] - px, other[3] - py)
+        if d < 1:
+            continue
+        factor = other[6] / (d + 12.0)
+        if other[1] == player:
+            friendly += factor
+        elif other[1] == -1:
+            neutral += factor
+        else:
+            enemy += factor
+    return friendly, neutral, enemy
+
+
+def _compute_incoming_threat(planet, fleets, player):
+    """Ratio of enemy fleet ships heading roughly toward this planet to garrison."""
+    px, py = planet[2], planet[3]
+    incoming = 0
+    for f in fleets:
+        if f[1] == player or f[1] == -1:
+            continue
+        fx, fy, angle = f[2], f[3], f[4]
+        to_planet = math.atan2(py - fy, px - fx)
+        diff = abs(angle - to_planet)
+        if diff > math.pi:
+            diff = 2 * math.pi - diff
+        if diff < math.pi / 4 and math.hypot(px - fx, py - fy) < 50:
+            incoming += f[6]
+    return incoming / max(1, planet[5])
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +213,8 @@ def compute_shaped_reward(obs_before: Dict, obs_after: Dict, player: int,
 # ---------------------------------------------------------------------------
 
 class StateEncoder:
-    """Convert raw Orbit Wars observations to a fixed-size feature vector."""
+    """Convert raw Orbit Wars observations to a fixed-size feature vector
+    with strategic features (reaction times, indirect wealth, domination)."""
 
     @staticmethod
     def encode(obs: Union[Dict, Any], turn: int = 0) -> np.ndarray:
@@ -113,25 +222,65 @@ class StateEncoder:
             player = obs.get("player", 0)
             raw_planets = obs.get("planets", []) or []
             raw_fleets = obs.get("fleets", []) or []
+            comet_ids = set(obs.get("comet_planet_ids", []) or [])
+            initial_planets = obs.get("initial_planets", []) or []
         else:
             player = obs.player
             raw_planets = obs.planets or []
             raw_fleets = obs.fleets or []
+            comet_ids = set(getattr(obs, "comet_planet_ids", []) or [])
+            initial_planets = getattr(obs, "initial_planets", []) or []
 
-        # ---- planet features ----
+        my_planets = [p for p in raw_planets if p[1] == player]
+        enemy_planets = [p for p in raw_planets if p[1] not in (-1, player)]
+        neutral_planets = [p for p in raw_planets if p[1] == -1]
+
+        # ---- strategic computations (once, shared across features) ----
+        my_times, enemy_times = _compute_reaction_times(raw_planets, my_planets, enemy_planets)
+
+        # Domination metrics
+        my_ships = sum(p[5] for p in my_planets)
+        enemy_ships = sum(p[5] for p in enemy_planets)
+        my_fleet_ships = sum(f[6] for f in raw_fleets if f[1] == player)
+        enemy_fleet_ships = sum(f[6] for f in raw_fleets if f[1] not in (-1, player))
+        my_total = my_ships + my_fleet_ships
+        enemy_total = enemy_ships + enemy_fleet_ships
+        domination = (my_total - enemy_total) / max(1, my_total + enemy_total)
+        my_prod = sum(p[6] for p in my_planets)
+        enemy_prod = sum(p[6] for p in enemy_planets)
+        is_ahead = float(domination > 0.18)
+        is_behind = float(domination < -0.20)
+        is_finishing = float(domination > 0.30 and my_prod > enemy_prod * 1.25)
+
+        # ---- planet features (PP_FEAT_DIM = 18) ----
         p_arr = np.zeros((MAX_PLANETS, PP_FEAT_DIM), dtype=np.float32)
         for i, p in enumerate(raw_planets[:MAX_PLANETS]):
             pid, owner, x, y, radius, ships, prod = p[:7]
-            center_dist = math.hypot(x - 50.0, y - 50.0) / 70.0  # normalized distance to sun
+            center_dist = math.hypot(x - 50.0, y - 50.0) / 70.0
+            mt = my_times.get(pid, 999)
+            et = enemy_times.get(pid, 999)
+            react_adv = np.clip((et - mt) / 30.0, -1.0, 1.0)  # +ve = I arrive first
+            friendly, neutral, enemy_inf = _compute_indirect_influence(p, raw_planets, player)
+            threat = _compute_incoming_threat(p, raw_fleets, player) if owner == player else 0.0
             p_arr[i] = [
-                x / BOARD_SIZE,
-                y / BOARD_SIZE,
-                radius / 10.0,
-                ships / MAX_SHIPS,
-                prod / 5.0,
-                (owner + 1) / 4.0,
-                float(owner == player),
-                center_dist,
+                x / BOARD_SIZE,                    # 0
+                y / BOARD_SIZE,                    # 1
+                radius / 10.0,                     # 2
+                ships / MAX_SHIPS,                 # 3
+                prod / 5.0,                        # 4
+                (owner + 1) / 4.0,                 # 5  owner proxy
+                float(owner == player),            # 6  is_mine
+                center_dist,                       # 7
+                np.clip(mt / 100.0, 0.0, 1.0),    # 8  my reaction time
+                np.clip(et / 100.0, 0.0, 1.0),    # 9  enemy reaction time
+                react_adv,                         # 10 reaction advantage
+                float(_is_static_planet(x, y, radius)),  # 11
+                float(pid in comet_ids),           # 12 is_comet
+                np.clip(friendly, 0.0, 1.0),      # 13 indirect friendly
+                np.clip(neutral, 0.0, 1.0),       # 14 indirect neutral
+                np.clip(enemy_inf, 0.0, 1.0),     # 15 indirect enemy
+                np.clip(threat, 0.0, 1.0),        # 16 incoming threat ratio
+                float(owner not in (-1, player)),  # 17 is_enemy
             ]
 
         # ---- fleet features (sin/cos for angle) ----
@@ -147,21 +296,12 @@ class StateEncoder:
                 float(owner == player),
             ]
 
-        # ---- global features ----
-        my_planets = [p for p in raw_planets if p[1] == player]
-        enemy_planets = [p for p in raw_planets if p[1] not in (-1, player)]
-        neutral_planets = [p for p in raw_planets if p[1] == -1]
-        my_ships = sum(p[5] for p in my_planets)
-        enemy_ships = sum(p[5] for p in enemy_planets)
-        my_fleet_ships = sum(f[6] for f in raw_fleets if f[1] == player)
-        enemy_fleet_ships = sum(f[6] for f in raw_fleets if f[1] not in (-1, player))
-        my_prod = sum(p[6] for p in my_planets)
-        enemy_prod = sum(p[6] for p in enemy_planets)
-
-        # Find best neutral target (production, weighted by distance)
-        best_neutral_prod = 0
-        best_neutral_ships = 0
+        # ---- global features (GLOBAL_DIM = 16) ----
+        # Find best neutral target
+        best_neutral_prod = 0.0
+        best_neutral_ships = 0.0
         closest_neutral_dist = 1.0
+        best_neutral_react = 0.0
         if my_planets and neutral_planets:
             nn = min(neutral_planets, key=lambda np_: min(
                 math.hypot(np_[2] - mp[2], np_[3] - mp[3]) for mp in my_planets))
@@ -169,19 +309,29 @@ class StateEncoder:
             best_neutral_ships = nn[5] / MAX_SHIPS
             closest_neutral_dist = min(
                 math.hypot(nn[2] - mp[2], nn[3] - mp[3]) / 70.0 for mp in my_planets)
+            # Reaction advantage for the best neutral target
+            nid = nn[0]
+            best_neutral_react = np.clip((enemy_times.get(nid, 999) - my_times.get(nid, 999)) / 30.0, -1.0, 1.0)
+
+        total_threat = sum(_compute_incoming_threat(p, raw_fleets, player) for p in my_planets)
 
         g_arr = np.array([
             player / 3.0,
             len(my_planets) / MAX_PLANETS,
             len(enemy_planets) / MAX_PLANETS,
-            (my_ships + my_fleet_ships) / MAX_SHIPS,
-            (enemy_ships + enemy_fleet_ships) / MAX_SHIPS,
+            my_total / MAX_SHIPS,
+            enemy_total / MAX_SHIPS,
             my_prod / 20.0,
             enemy_prod / 20.0,
             turn / 500.0,
             best_neutral_prod,
             best_neutral_ships,
             closest_neutral_dist,
+            np.clip(domination, -1.0, 1.0),   # 11 domination ratio
+            is_ahead,                           # 12
+            is_behind,                          # 13
+            is_finishing,                       # 14
+            np.clip(total_threat, 0.0, 1.0),   # 15 total incoming threat
         ], dtype=np.float32)
 
         return np.concatenate([p_arr.ravel(), f_arr.ravel(), g_arr])
@@ -202,18 +352,21 @@ class ActorCritic(nn.Module):
     plus a scalar value estimate.
     """
 
-    def __init__(self, feature_dim: int, hidden_dim: int = 256):
+    def __init__(self, feature_dim: int, hidden_dim: int = 384):
         super().__init__()
         self.feature_dim = feature_dim
         self.n_actions = N_ACTIONS
 
         self.backbone = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
-            nn.Tanh(),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
         )
 
         # Multi-action policy heads
@@ -228,7 +381,7 @@ class ActorCritic(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear) and m is not self.value_head:
-                nn.init.orthogonal_(m.weight, gain=0.01)
+                nn.init.orthogonal_(m.weight, gain=1.41)
                 nn.init.constant_(m.bias, 0)
         if hasattr(self, 'value_head'):
             nn.init.orthogonal_(self.value_head.weight, gain=1.0)
@@ -237,6 +390,12 @@ class ActorCritic(nn.Module):
     def get_value(self, x: torch.Tensor) -> torch.Tensor:
         h = self.backbone(x)
         return self.value_head(h)
+
+    def reset_value_head(self):
+        """Reinitialize the value head — use when switching opponents to prevent
+        stale optimistic value predictions from corrupting GAE advantages."""
+        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+        nn.init.constant_(self.value_head.bias, 0)
 
     def _forward_heads(self, h: torch.Tensor, src_mask: torch.Tensor, tgt_mask: torch.Tensor):
         """Return lists of logits per action head."""
@@ -404,7 +563,7 @@ class RolloutBuffer:
 def make_src_mask(raw_planets: List, player: int) -> np.ndarray:
     mask = np.zeros(MAX_PLANETS, dtype=np.float32)
     for i, p in enumerate(raw_planets[:MAX_PLANETS]):
-        if p[1] == player:
+        if p[1] == player and p[5] > 1:  # need at least 2 ships to launch
             mask[i] = 1.0
     if mask.sum() < 0.5:
         mask[0] = 1.0
@@ -546,7 +705,7 @@ class PPOAgent(BaseAgent):
             return None
         from_id = src_p[0]
         angle = math.atan2(tgt_p[3] - src_p[3], tgt_p[2] - src_p[2])
-        ratios = [0.25, 0.40, 0.60, 0.80, 1.0]
+        ratios = [0.05, 0.12, 0.22, 0.35, 0.50, 0.65, 0.80, 1.0]
         ratio = ratios[min(ratio_bin, N_RATIOS - 1)]
         ships = max(1, int(src_p[5] * ratio))
         if ships >= src_p[5]:
@@ -581,6 +740,10 @@ class PPOAgent(BaseAgent):
         self.policy.eval()
         logger.info(f"Model loaded from {path}")
 
+    def reset_value_head(self):
+        """Reinitialize value head — call when switching to harder opponents."""
+        self.policy.reset_value_head()
+
 
 # ---------------------------------------------------------------------------
 # PPO Trainer
@@ -594,6 +757,7 @@ class PPOTrainer:
         env,
         agent: PPOAgent,
         opponent_agents: Optional[List[BaseAgent]] = None,
+        opponent_probs: Optional[List[float]] = None,
         lr: float = LR,
         gamma: float = GAMMA,
         gae_lambda: float = GAE_LAMBDA,
@@ -603,12 +767,18 @@ class PPOTrainer:
         update_epochs: int = UPDATE_EPOCHS,
         batch_size: int = BATCH_SIZE,
         max_grad_norm: float = MAX_GRAD_NORM,
+        target_kl: float = 0.02,
         log_dir: str = "./log",
         device: str = "auto",
     ):
         self.env = env
         self.agent = agent
         self.opponent_agents = opponent_agents or []
+        if opponent_probs is not None:
+            total = sum(opponent_probs)
+            self.opponent_probs = [p / total for p in opponent_probs]
+        else:
+            self.opponent_probs = None
         self.all_agents = [agent] + self.opponent_agents
 
         if device == "auto":
@@ -626,12 +796,25 @@ class PPOTrainer:
         self.update_epochs = update_epochs
         self.batch_size = batch_size
         self.max_grad_norm = max_grad_norm
+        self.target_kl = target_kl
         self.log_dir = log_dir
         self.total_steps = 0
         self.episode_count = 0
         self._prev_obs: Optional[Dict] = None
 
+    def _select_opponent(self):
+        """Sample one opponent from the pool (with optional probability weights)."""
+        if len(self.opponent_agents) <= 1:
+            return self.opponent_agents[0] if self.opponent_agents else None
+        idx = np.random.choice(len(self.opponent_agents), p=self.opponent_probs)
+        return self.opponent_agents[idx]
+
     def _run_episode(self, max_steps: int = 500, render: bool = False) -> Dict:
+        # Select opponent for this episode (supports opponent mixing)
+        opponent = self._select_opponent()
+        if opponent is not None and opponent is not self.all_agents[-1]:
+            self.all_agents = [self.agent, opponent]
+
         observations = self.env.reset()
         if observations is None:
             observations = [None] * len(self.all_agents)
@@ -663,9 +846,10 @@ class PPOTrainer:
             observations, rewards, dones, info = self.env.step(actions)
             obs_after = observations[0] if observations else None
 
-            # Compute shaped reward (delta in state score)
+            # Compute shaped reward (delta in state score + terminal outcome)
             player = self.agent.player_id
-            shaped = compute_shaped_reward(obs_before, obs_after, player)
+            terminal = rewards[0] if dones and dones[0] else 0.0
+            shaped = compute_shaped_reward(obs_before, obs_after, player, terminal)
             self.agent._cached_reward = shaped
             self.agent._cached_done = dones[0] if dones else False
 
@@ -708,10 +892,13 @@ class PPOTrainer:
 
         total_loss = 0.0
         approx_kl = 0.0
+        epochs_run = 0
+        kl_threshold = self.target_kl * 1.5
 
-        for _ in range(self.update_epochs):
+        for epoch in range(self.update_epochs):
             batches = buf.get_batches(self.batch_size)
             epoch_loss = 0.0
+            epoch_kl = 0.0
             for batch in batches:
                 state = batch["state"].to(self.device)
                 src_indices = [b.to(self.device) for b in batch["src_indices"]]
@@ -743,15 +930,24 @@ class PPOTrainer:
 
                 epoch_loss += loss.item()
                 with torch.no_grad():
-                    approx_kl = (log_prob - old_lp).mean().item()
+                    epoch_kl += (log_prob - old_lp).mean().item()
 
+            epoch_kl_avg = epoch_kl / max(len(batches), 1)
+            approx_kl = epoch_kl_avg
             total_loss += epoch_loss / max(len(batches), 1)
+            epochs_run += 1
 
-        avg_loss = total_loss / self.update_epochs
+            # KL early stopping: prevent destructive policy updates
+            if epoch_kl_avg > kl_threshold:
+                logger.debug(f"KL early stop at epoch {epoch+1}: kl={epoch_kl_avg:.4f} > {kl_threshold:.4f}")
+                break
+
+        avg_loss = total_loss / epochs_run
         explained_var = self._explained_variance(buf)
         logger.info(
             f"PPO update | steps={self.total_steps} | loss={avg_loss:.4f} | "
-            f"kl={approx_kl:.4f} | ev={explained_var:.4f} | buf={len(buf)}"
+            f"kl={approx_kl:.4f} | ep={epochs_run}/{self.update_epochs} | "
+            f"ev={explained_var:.4f} | buf={len(buf)}"
         )
 
         buf.reset()
@@ -777,6 +973,15 @@ class PPOTrainer:
                     f"agent={self.agent.name}, "
                     f"opponents={[a.name for a in self.opponent_agents]}")
 
+        # tqdm progress bar (optional)
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(total=num_episodes, desc="PPO", unit="ep", dynamic_ncols=True)
+            _use_pbar = True
+        except ImportError:
+            pbar = None
+            _use_pbar = False
+
         for ep in range(1, num_episodes + 1):
             render = render_every > 0 and ep % render_every == 0
             ep_result = self._run_episode(render=render)
@@ -795,12 +1000,25 @@ class PPOTrainer:
                 f"buf={ep_result['transitions']}"
             )
 
+            if _use_pbar:
+                win_rate = float(np.mean([1.0 if r["agent_reward"] > 0 else 0.0
+                                          for r in results[-100:]]))
+                pbar.set_postfix(
+                    rew=f"{ep_result['agent_reward']:.1f}",
+                    avg50=f"{avg_reward:.2f}",
+                    wr=f"{win_rate:.1%}",
+                )
+                pbar.update(1)
+
             if save_every > 0 and ep % save_every == 0:
                 self.agent.save(os.path.join(save_dir, f"ppo_ep{ep}.pt"))
 
             if ep_result["agent_reward"] > best_reward:
                 best_reward = ep_result["agent_reward"]
                 self.agent.save(os.path.join(save_dir, "ppo_best.pt"))
+
+        if _use_pbar:
+            pbar.close()
 
         total = time.time() - start
         avg_r = float(np.mean([r["agent_reward"] for r in results]))
