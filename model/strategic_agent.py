@@ -180,6 +180,8 @@ DOMINATION_CONSOLIDATION_THRESHOLD = 0.25
 DOOMED_EVAC_TURN_LIMIT = 24
 DOOMED_MIN_SHIPS = 8
 
+BEAM_WIDTH = 10
+
 SOFT_ACT_DEADLINE = 0.82
 HEAVY_PHASE_MIN_TIME = 0.16
 OPTIONAL_PHASE_MIN_TIME = 0.08
@@ -2011,6 +2013,317 @@ def build_crash_exploit_missions(world, policy, planned_commitments, modes):
     return missions
 
 
+def _beam_select_missions(missions, world, policy, modes, base_commitments,
+                          source_inventory_fn, source_attack_fn, beam_width):
+    """Select missions via beam search to avoid greedy local optima.
+
+    Returns a set of chosen mission indices (0-based in the missions list).
+    """
+
+    _BeamState = namedtuple("_BeamState",
+                            ["score", "spent", "extra_commits", "targets_taken", "chosen"])
+
+    init = _BeamState(
+        score=0.0,
+        spent=defaultdict(int),
+        extra_commits=defaultdict(list),
+        targets_taken=set(),
+        chosen=[],
+    )
+    beam = [init]
+
+    for idx, mission in enumerate(missions):
+        new_beam = []
+        for state in beam:
+            # Branch 1: skip
+            new_beam.append(state)
+
+            # Branch 2: commit
+            plan = _try_beam_commit(
+                mission, state, world, policy, modes, base_commitments,
+                source_inventory_fn, source_attack_fn,
+            )
+            if plan is not None:
+                new_score, new_spent, new_commits, new_targets = plan
+                new_beam.append(_BeamState(
+                    score=new_score,
+                    spent=new_spent,
+                    extra_commits=new_commits,
+                    targets_taken=new_targets,
+                    chosen=state.chosen + [idx],
+                ))
+
+        # Dominance pruning: same targets_taken + same spent → keep higher score
+        dedup = {}
+        for s in new_beam:
+            key = (tuple(sorted(s.targets_taken)), tuple(sorted(s.spent.items())))
+            if key not in dedup or s.score > dedup[key].score:
+                dedup[key] = s
+        new_beam = sorted(dedup.values(), key=lambda s: -s.score)[:beam_width]
+        beam = new_beam
+
+    return set(beam[0].chosen)
+
+
+def _try_beam_commit(mission, state, world, policy, modes, base_commitments,
+                     source_inventory_fn, source_attack_fn):
+    """Try to add a mission to a beam state.  Returns updated state or None."""
+    import copy as _copy
+
+    target = world.planet_by_id[mission.target_id]
+
+    if mission.target_id in state.targets_taken:
+        return None
+
+    if mission.kind == "swarm":
+        # Multi-source swarm — check each source has ships
+        limits = {}
+        for option in mission.options:
+            left = source_attack_fn(option.src_id)
+            actual_left = left - state.spent[option.src_id]
+            if actual_left <= 0:
+                return None
+            limits[option.src_id] = min(actual_left, option.send_cap)
+
+        total_cap = sum(limits.values())
+        if total_cap < min(o.needed for o in mission.options):
+            return None
+
+        need = world.min_ships_to_own_at(
+            target.id, mission.turns, world.player,
+            planned_commitments=merge_commitments(base_commitments, state.extra_commits),
+            upper_bound=total_cap,
+        )
+        if need <= 0 or total_cap < need:
+            return None
+
+        # ETA check
+        ordered = sorted(mission.options, key=lambda o: (o.turns, -limits[o.src_id]))
+        turns_list = [world.plan_shot(o.src_id, target.id, limits[o.src_id])[1]
+                      for o in ordered
+                      if world.plan_shot(o.src_id, target.id, limits[o.src_id]) is not None]
+        if len(turns_list) != len(ordered):
+            return None
+        eta_tol = swarm_eta_tolerance(mission.options, target, world)
+        if max(turns_list) - min(turns_list) > eta_tol:
+            return None
+
+        new_spent = _copy.copy(state.spent)
+        new_spent = defaultdict(int, new_spent)
+        new_commits = {k: list(v) for k, v in state.extra_commits.items()}
+        new_commits = defaultdict(list, new_commits)
+
+        # Proportionally allocate ships among sources
+        remaining = need
+        for idx, (option, limit) in enumerate(ordered):
+            rest = sum(l for _, l in ordered[idx + 1:])
+            send = min(limit, max(0, remaining - rest))
+            remaining -= send
+            new_spent[option.src_id] += send
+        if remaining > 0:
+            return None
+
+        actual_turns = max(turns_list)
+        for option, _ in ordered:
+            send = limits[option.src_id]
+            if send > 0:
+                new_commits[target.id].append((actual_turns, world.player, send))
+
+        new_score = state.score + mission.score
+        new_targets = set(state.targets_taken) | {mission.target_id}
+        return new_score, new_spent, new_commits, new_targets
+
+    else:
+        # Single-source mission
+        option = mission.options[0]
+        src = world.planet_by_id[option.src_id]
+
+        if mission.kind == "reinforce":
+            left = min(
+                source_inventory_fn(option.src_id),
+                int(src.ships * REINFORCE_MAX_SOURCE_FRACTION),
+            )
+        else:
+            left = source_attack_fn(option.src_id)
+
+        actual_left = left - state.spent[option.src_id]
+        if actual_left <= 0 or actual_left < option.needed:
+            return None
+
+        new_spent = _copy.copy(state.spent)
+        new_spent = defaultdict(int, new_spent)
+        new_spent[option.src_id] += option.send_cap
+
+        new_commits = {k: list(v) for k, v in state.extra_commits.items()}
+        new_commits = defaultdict(list, new_commits)
+        new_commits[target.id].append((option.turns, world.player, option.send_cap))
+
+        new_score = state.score + mission.score
+        new_targets = set(state.targets_taken) | {mission.target_id}
+        return new_score, new_spent, new_commits, new_targets
+
+
+def merge_commitments(base, extra):
+    """Merge base commitments dict with extra commitments dict."""
+    merged = defaultdict(list)
+    for k, v in base.items():
+        merged[k].extend(v)
+    for k, v in extra.items():
+        merged[k].extend(v)
+    return merged
+
+
+def _commit_single_mission(mission, option, src, target, left, world,
+                           planned_commitments, modes, policy, append_move):
+    """Execute a single-source mission commitment. Returns ships sent or None."""
+    if mission.kind == "reinforce":
+        plan = settle_reinforce_plan(
+            src, target, left, min(left, option.send_cap),
+            world, planned_commitments, option.anchor_turn, mission.turns,
+        )
+    elif mission.kind == "rescue":
+        plan = settle_plan(
+            src, target, left, min(left, option.send_cap),
+            world, planned_commitments, modes, policy,
+            mission="rescue",
+            eval_turn_fn=lambda _t, hold=mission.turns: hold,
+            anchor_turn=option.anchor_turn,
+        )
+    elif mission.kind == "snipe":
+        plan = settle_plan(
+            src, target, left, min(left, option.send_cap),
+            world, planned_commitments, modes, policy,
+            mission="snipe",
+            eval_turn_fn=lambda t, eta=option.anchor_turn: max(t, eta),
+            anchor_turn=option.anchor_turn,
+        )
+    elif mission.kind == "crash_exploit":
+        plan = settle_plan(
+            src, target, left, min(left, option.send_cap),
+            world, planned_commitments, modes, policy,
+            mission="crash_exploit",
+            eval_turn_fn=lambda t, desired=option.anchor_turn: max(t, desired),
+            anchor_turn=option.anchor_turn,
+            anchor_tolerance=CRASH_EXPLOIT_ETA_WINDOW,
+        )
+    else:
+        plan = settle_plan(
+            src, target, left, min(left, option.send_cap),
+            world, planned_commitments, modes, policy,
+            mission="capture",
+        )
+    if plan is None:
+        return None
+    angle, turns, _, need, send = plan
+    if send < need or need > left:
+        return None
+    sent = append_move(option.src_id, angle, send)
+    if sent < need:
+        return None
+    planned_commitments[target.id].append((turns, world.player, int(sent)))
+    return int(sent)
+
+
+def _commit_swarm_mission(mission, target, world, planned_commitments,
+                          source_attack_fn, append_move):
+    """Execute a multi-source swarm commitment. Returns total sent or None."""
+    limits = []
+    for option in mission.options:
+        left = source_attack_fn(option.src_id)
+        limits.append(min(left, option.send_cap))
+    if min(limits) <= 0:
+        return None
+
+    need = world.min_ships_to_own_at(
+        target.id, mission.turns, world.player,
+        planned_commitments=planned_commitments,
+        upper_bound=sum(limits),
+    )
+    if need <= 0 or sum(limits) < need:
+        return None
+
+    ordered = sorted(
+        zip(mission.options, limits),
+        key=lambda item: (item[0].turns, -item[1], item[0].src_id),
+    )
+    remaining = need
+    sends = {}
+    for idx, (option, limit) in enumerate(ordered):
+        remaining_other = sum(l for _, l in ordered[idx + 1:])
+        send = min(limit, max(0, remaining - remaining_other))
+        sends[option.src_id] = send
+        remaining -= send
+    if remaining > 0:
+        return None
+
+    reaimed = []
+    for option, _ in ordered:
+        send = sends.get(option.src_id, 0)
+        if send <= 0:
+            continue
+        aim = world.plan_shot(option.src_id, target.id, send)
+        if aim is None:
+            return None
+        angle, turns, _, _ = aim
+        reaimed.append((option.src_id, angle, turns, send))
+
+    turns_only = [t for _, _, t, _ in reaimed]
+    eta_tol = swarm_eta_tolerance(mission.options, target, world)
+    if max(turns_only) - min(turns_only) > eta_tol:
+        return None
+
+    actual_joint_turn = max(turns_only)
+    owner_after, _ = world.projected_state(
+        target.id, actual_joint_turn,
+        planned_commitments=planned_commitments,
+        extra_arrivals=[(turn, world.player, send) for _, _, turn, send in reaimed],
+    )
+    if owner_after != world.player:
+        return None
+
+    committed = []
+    for src_id, angle, turns, send in reaimed:
+        actual = append_move(src_id, angle, send)
+        if actual <= 0:
+            continue
+        committed.append((turns, world.player, int(actual)))
+    if sum(c[2] for c in committed) < need:
+        return None
+    planned_commitments[target.id].extend(committed)
+    return sum(c[2] for c in committed)
+
+
+def _commit_missions_greedy(missions, world, planned_commitments, modes, policy,
+                            source_inventory_fn, source_attack_fn, append_move, expired):
+    """Original greedy mission commitment loop (fallback)."""
+    for mission in missions:
+        if expired():
+            return
+        target = world.planet_by_id[mission.target_id]
+
+        if mission.kind in ("single", "snipe", "rescue", "recapture", "reinforce", "crash_exploit"):
+            option = mission.options[0]
+            src = world.planet_by_id[option.src_id]
+            if mission.kind == "reinforce":
+                left = min(
+                    source_inventory_fn(option.src_id),
+                    int(src.ships * REINFORCE_MAX_SOURCE_FRACTION),
+                )
+            else:
+                left = source_attack_fn(option.src_id)
+            if left <= 0:
+                continue
+            _commit_single_mission(
+                mission, option, src, target, left, world,
+                planned_commitments, modes, policy, append_move,
+            )
+        else:
+            _commit_swarm_mission(
+                mission, target, world, planned_commitments,
+                source_attack_fn, append_move,
+            )
+
+
 def plan_moves(world, deadline=None):
     def expired():
         return deadline is not None and time.perf_counter() > deadline
@@ -2354,142 +2667,53 @@ def plan_moves(world, deadline=None):
 
     missions.sort(key=lambda item: -item.score)
 
-    # Commit missions
-    for mission in missions:
-        if expired():
-            return finalize_moves()
-        target = world.planet_by_id[mission.target_id]
+    # Beam-search mission selection
+    if missions and BEAM_WIDTH >= 2:
+        chosen_set = _beam_select_missions(
+            missions, world, policy, modes, planned_commitments,
+            source_inventory_left, source_attack_left, BEAM_WIDTH,
+        )
+        # Re-commit chosen missions via exact settle_plan (in score order)
+        committed_targets = set()
+        for idx in sorted(chosen_set, key=lambda i: -missions[i].score):
+            if expired():
+                return finalize_moves()
+            mission = missions[idx]
+            target = world.planet_by_id[mission.target_id]
+            if target.id in committed_targets:
+                continue
 
-        if mission.kind in ("single", "snipe", "rescue", "recapture", "reinforce", "crash_exploit"):
-            option = mission.options[0]
-            src = world.planet_by_id[option.src_id]
-            if mission.kind == "reinforce":
-                left = min(
-                    source_inventory_left(option.src_id),
-                    int(src.ships * REINFORCE_MAX_SOURCE_FRACTION),
+            if mission.kind in ("single", "snipe", "rescue", "recapture", "reinforce", "crash_exploit"):
+                option = mission.options[0]
+                src = world.planet_by_id[option.src_id]
+                if mission.kind == "reinforce":
+                    left = min(
+                        source_inventory_left(option.src_id),
+                        int(src.ships * REINFORCE_MAX_SOURCE_FRACTION),
+                    )
+                else:
+                    left = source_attack_left(option.src_id)
+                if left <= 0:
+                    continue
+                sent = _commit_single_mission(
+                    mission, option, src, target, left, world,
+                    planned_commitments, modes, policy, append_move,
                 )
+                if sent is not None and sent >= option.needed:
+                    committed_targets.add(target.id)
             else:
-                left = source_attack_left(option.src_id)
-            if left <= 0:
-                continue
-
-            if mission.kind == "reinforce":
-                plan = settle_reinforce_plan(
-                    src, target, left, min(left, option.send_cap),
-                    world, planned_commitments, option.anchor_turn, mission.turns,
+                sent = _commit_swarm_mission(
+                    mission, target, world, planned_commitments,
+                    source_attack_left, append_move,
                 )
-            elif mission.kind == "rescue":
-                plan = settle_plan(
-                    src, target, left, min(left, option.send_cap),
-                    world, planned_commitments, modes, policy,
-                    mission="rescue",
-                    eval_turn_fn=lambda _turns, hold_turn=mission.turns: hold_turn,
-                    anchor_turn=option.anchor_turn,
-                )
-            elif mission.kind == "snipe":
-                plan = settle_plan(
-                    src, target, left, min(left, option.send_cap),
-                    world, planned_commitments, modes, policy,
-                    mission="snipe",
-                    eval_turn_fn=lambda turns, enemy_eta=option.anchor_turn: max(turns, enemy_eta),
-                    anchor_turn=option.anchor_turn,
-                )
-            elif mission.kind == "crash_exploit":
-                plan = settle_plan(
-                    src, target, left, min(left, option.send_cap),
-                    world, planned_commitments, modes, policy,
-                    mission="crash_exploit",
-                    eval_turn_fn=lambda turns, desired_arrival=option.anchor_turn: max(turns, desired_arrival),
-                    anchor_turn=option.anchor_turn,
-                    anchor_tolerance=CRASH_EXPLOIT_ETA_WINDOW,
-                )
-            else:
-                plan = settle_plan(
-                    src, target, left, min(left, option.send_cap),
-                    world, planned_commitments, modes, policy,
-                    mission="capture",
-                )
-            if plan is None:
-                continue
-
-            angle, turns, _, need, send = plan
-            if send < need or need > left:
-                continue
-
-            sent = append_move(option.src_id, angle, send)
-            if sent < need:
-                continue
-            planned_commitments[target.id].append((turns, world.player, int(sent)))
-            continue
-
-        # Multi-source swarm commitment
-        limits = []
-        for option in mission.options:
-            left = source_attack_left(option.src_id)
-            limits.append(min(left, option.send_cap))
-        if min(limits) <= 0:
-            continue
-
-        missing = world.min_ships_to_own_at(
-            target.id, mission.turns, world.player,
-            planned_commitments=planned_commitments,
-            upper_bound=sum(limits),
+                if sent is not None:
+                    committed_targets.add(target.id)
+    else:
+        # Original greedy loop (fallback when beam width < 2)
+        _commit_missions_greedy(
+            missions, world, planned_commitments, modes, policy,
+            source_inventory_left, source_attack_left, append_move, expired,
         )
-        if missing <= 0 or sum(limits) < missing:
-            continue
-
-        ordered = sorted(
-            zip(mission.options, limits),
-            key=lambda item: (item[0].turns, -item[1], item[0].src_id),
-        )
-        remaining = missing
-        sends = {}
-        for idx, (option, limit) in enumerate(ordered):
-            remaining_other = sum(other_limit for _, other_limit in ordered[idx + 1:])
-            send = min(limit, max(0, remaining - remaining_other))
-            sends[option.src_id] = send
-            remaining -= send
-        if remaining > 0:
-            continue
-
-        reaimed = []
-        for option, _ in ordered:
-            send = sends.get(option.src_id, 0)
-            if send <= 0:
-                continue
-            src = world.planet_by_id[option.src_id]
-            fixed_aim = world.plan_shot(src.id, target.id, send)
-            if fixed_aim is None:
-                reaimed = []
-                break
-            angle, turns, _, _ = fixed_aim
-            reaimed.append((option.src_id, angle, turns, send))
-        if not reaimed:
-            continue
-
-        turns_only = [item[2] for item in reaimed]
-        eta_tol = swarm_eta_tolerance(mission.options, target, world)
-        if max(turns_only) - min(turns_only) > eta_tol:
-            continue
-
-        actual_joint_turn = max(turns_only)
-        owner_after, _ = world.projected_state(
-            target.id, actual_joint_turn,
-            planned_commitments=planned_commitments,
-            extra_arrivals=[(turns, world.player, send) for _, _, turns, send in reaimed],
-        )
-        if owner_after != world.player:
-            continue
-
-        committed = []
-        for src_id, angle, turns, send in reaimed:
-            actual = append_move(src_id, angle, send)
-            if actual <= 0:
-                continue
-            committed.append((turns, world.player, int(actual)))
-        if sum(item[2] for item in committed) < missing:
-            continue
-        planned_commitments[target.id].extend(committed)
 
     # Follow-up pass
     if not world.is_very_late and allow_optional_phase():

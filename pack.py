@@ -31,6 +31,13 @@ def make_main(model_name: str, model_path: str | None = None) -> str:
             "def agent(obs, config=None):\n"
             "    return ppo_agent(obs, config)\n"
         )
+    elif model_name == "strategic_agent":
+        return (
+            "from model.strategic_agent import strategic_agent\n"
+            "\n"
+            "def agent(obs, config=None):\n"
+            "    return strategic_agent(obs, config)\n"
+        )
     else:
         return (
             f"from model import {model_name}\n"
