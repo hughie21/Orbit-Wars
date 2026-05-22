@@ -38,6 +38,14 @@ def parse_args():
         default="./eval_results.json",
         help="Output file for results",
     )
+    parser.add_argument(
+        "--strategic_load", type=str, default=None,
+        help="Path to load pre-trained strategic model weights (.pkl)"
+    )
+    parser.add_argument(
+        "--strategic_learn", action="store_true",
+        help="Enable online learning for strategic agent during evaluation"
+    )
     return parser.parse_args()
 
 
@@ -65,7 +73,16 @@ def main():
     agents = []
     agent_names = []
     for i, agent_type in enumerate(args.agents):
-        agent = load_agent(agent_type)
+        kwargs = {}
+        if agent_type == "strategic":
+            kwargs["enable_learning"] = args.strategic_learn
+        agent = load_agent(agent_type, **kwargs)
+        # Load strategic weights if provided (only for first strategic agent)
+        if agent_type == "strategic" and args.strategic_load:
+            if agent.load_weights(args.strategic_load):
+                logger.info(f"Loaded strategic weights from: {args.strategic_load}")
+            else:
+                logger.warning(f"Could not load strategic weights from: {args.strategic_load}")
         agents.append(agent)
         agent_names.append(f"{agent_type}_{i}")
 
@@ -94,6 +111,20 @@ def main():
             num_episodes=args.num_episodes,
         )
         all_results.append(results)
+
+    # ── Strategic agent: post-evaluation training ─────────────────────
+    if args.strategic_learn:
+        for i, agent in enumerate(agents):
+            if agent.name == "StrategicAgent" and agent.enable_learning:
+                # Find results for this agent
+                for result in all_results:
+                    if result.get("agent") == agent_names[i]:
+                        for ep in result.get("episodes", []):
+                            # Agent is index 0 in matchup, check if it won
+                            won = ep.get("winner", -1) == 0
+                            agent.record_episode_outcome(won)
+                        agent.train_models()
+                        logger.info(f"Trained strategic agent {agent_names[i]} on evaluation outcomes")
 
     # Print summary
     logger.info("=" * 60)

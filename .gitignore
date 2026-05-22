@@ -5,3 +5,4 @@ venv
 *.pyc
 log/*
 checkpoints/*
+weights/

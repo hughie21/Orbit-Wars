@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
 from framework.agent import BaseAgent
+from model.opponent_model import OpponentModel
+from model.value_network import ValueNetwork
 
 # ============================================================
 # Shared Configuration
@@ -888,7 +890,16 @@ class WorldModel:
             _, aim = seeded
             enemy_t = min(enemy_t, aim[1])
 
-        cached = (my_t, enemy_t)
+        # ── Opponent-model-augmented enemy reaction ──────────────────────
+        predicted_enemy_t = 10 ** 9
+        predicted_enemy_ships = 0
+        if hasattr(self, 'opponent_predictions') and self.opponent_predictions:
+            pred_arrivals = self.opponent_predictions.get(target_id, [])
+            if pred_arrivals:
+                predicted_enemy_t = min(eta for eta, _, _ in pred_arrivals)
+                predicted_enemy_ships = sum(ships for _, _, ships in pred_arrivals)
+
+        cached = (my_t, enemy_t, predicted_enemy_t, predicted_enemy_ships)
         self.reaction_cache[target_id] = cached
         return cached
 
@@ -1125,7 +1136,10 @@ def min_legal_reaction_time(target, sources, world):
 
 
 def policy_reaction_times(target_id, policy):
-    return policy["reaction_time_map"].get(target_id, (10 ** 9, 10 ** 9))
+    entry = policy["reaction_time_map"].get(target_id, (10 ** 9, 10 ** 9))
+    if len(entry) == 4:
+        return entry  # (my_t, enemy_t, predicted_enemy_t, predicted_enemy_ships)
+    return entry[0], entry[1]  # legacy 2-tuple
 
 
 def candidate_time_valid(target, turns, world, remaining_buffer):
@@ -1211,6 +1225,13 @@ def build_policy_state(world, deadline=None):
     def expired():
         return deadline is not None and time.perf_counter() > deadline
 
+    # ── Opponent model: predict enemy launches for this turn ─────────────
+    opponent_predictions = {}
+    global _opponent_model
+    if _opponent_model is not None:
+        opponent_predictions = _opponent_model.predict_enemy_launches(world)
+    world.opponent_predictions = opponent_predictions
+
     indirect_wealth_map = {}
     for target_id, features in world.indirect_feature_map.items():
         friendly, neutral, enemy = features
@@ -1223,24 +1244,38 @@ def build_policy_state(world, deadline=None):
     reserve = {}
     attack_budget = {}
     reaction_time_map = {}
+    predicted_enemy_arrivals = defaultdict(list)
 
     for target in world.planets:
         if expired():
             break
         if target.owner == world.player:
             continue
-        my_sources = nearest_sources_to_target(target, world.my_planets, REACTION_SOURCE_TOP_K_MY)
-        enemy_sources = nearest_sources_to_target(target, world.enemy_planets, REACTION_SOURCE_TOP_K_ENEMY)
-        my_t = min_legal_reaction_time(target, my_sources, world)
-        enemy_t = min_legal_reaction_time(target, enemy_sources, world)
-        reaction_time_map[target.id] = (my_t, enemy_t)
+        # Use enhanced reaction_times() which includes opponent model predictions
+        rt = world.reaction_times(target.id)
+        reaction_time_map[target.id] = rt
+
+        # Collect predicted enemy arrivals for this target (for use in planning)
+        if len(rt) >= 4 and rt[2] < 10 ** 8:
+            predicted_enemy_arrivals[target.id] = opponent_predictions.get(target.id, [])
 
     for planet in world.my_planets:
         if expired():
             break
         exact_keep = world.keep_needed_map.get(planet.id, 0)
 
+        # ── Enhanced proactive defense: use opponent model predictions ───
         proactive_keep = 0
+        opp_pred_for_planet = opponent_predictions.get(planet.id, [])
+        if opp_pred_for_planet:
+            total_predicted_enemy_ships = sum(ships for _, _, ships in opp_pred_for_planet)
+            earliest_arrival = min(eta for eta, _, _ in opp_pred_for_planet)
+            if earliest_arrival <= PROACTIVE_DEFENSE_HORIZON:
+                proactive_keep = max(
+                    proactive_keep,
+                    int(total_predicted_enemy_ships * PROACTIVE_DEFENSE_RATIO),
+                )
+
         for enemy in nearest_sources_to_target(planet, world.enemy_planets, PROACTIVE_ENEMY_TOP_K):
             enemy_aim = world.plan_shot(enemy.id, planet.id, max(1, int(enemy.ships)))
             if enemy_aim is None:
@@ -1262,6 +1297,7 @@ def build_policy_state(world, deadline=None):
         "reserve": reserve,
         "attack_budget": attack_budget,
         "reaction_time_map": reaction_time_map,
+        "predicted_enemy_arrivals": predicted_enemy_arrivals,
     }
 
 
@@ -1299,14 +1335,21 @@ def build_modes(world):
 def is_safe_neutral(target, policy):
     if target.owner != -1:
         return False
-    my_t, enemy_t = policy_reaction_times(target.id, policy)
+    rt = policy_reaction_times(target.id, policy)
+    my_t, enemy_t = rt[0], rt[1]
+    # Use opponent-model-augmented enemy reaction time if available
+    if len(rt) >= 3 and rt[2] < 10 ** 8:
+        enemy_t = min(enemy_t, rt[2])  # earlier of geometric or predicted
     return my_t <= enemy_t - SAFE_NEUTRAL_MARGIN
 
 
 def is_contested_neutral(target, policy):
     if target.owner != -1:
         return False
-    my_t, enemy_t = policy_reaction_times(target.id, policy)
+    rt = policy_reaction_times(target.id, policy)
+    my_t, enemy_t = rt[0], rt[1]
+    if len(rt) >= 3 and rt[2] < 10 ** 8:
+        enemy_t = min(enemy_t, rt[2])
     return abs(my_t - enemy_t) <= CONTESTED_NEUTRAL_MARGIN
 
 
@@ -1318,7 +1361,10 @@ def opening_filter(target, arrival_turns, needed, src_available, world, policy):
     if world.is_static(target.id):
         return False
 
-    my_t, enemy_t = policy_reaction_times(target.id, policy)
+    rt = policy_reaction_times(target.id, policy)
+    my_t, enemy_t = rt[0], rt[1]
+    if len(rt) >= 3 and rt[2] < 10 ** 8:
+        enemy_t = min(enemy_t, rt[2])
     reaction_gap = enemy_t - my_t
     if (
         target.production >= SAFE_OPENING_PROD_THRESHOLD
@@ -1399,6 +1445,25 @@ def target_value(target, arrival_turns, mission, world, modes, policy):
     if modes["is_dominating"] and target.owner == -1 and is_contested_neutral(target, policy):
         value *= 0.92
 
+    # ── Blend heuristic value with learned value network ─────────────
+    heuristic_value = value
+    global _value_network
+    if _value_network is not None:
+        try:
+            learned_value = _value_network.predict_value(
+                world, target, mission, arrival_turns, policy, modes,
+            )
+            # Normalize learned value to comparable scale, then blend
+            learned_scaled = learned_value * max(1.0, heuristic_value)
+            blended = _value_network.blend_value(learned_scaled, heuristic_value)
+            # Record experience for later training
+            _pending_experiences.append(
+                (world, target, mission, arrival_turns, policy, modes, heuristic_value)
+            )
+            return max(0.0, blended)
+        except Exception:
+            pass
+
     return value
 
 
@@ -1408,7 +1473,25 @@ def reinforce_value(target, hold_until, world, policy):
     if world.enemy_planets and nearest_distance_to_set(target.x, target.y, world.enemy_planets) < 22:
         value *= DEFENSE_FRONTIER_SCORE_MULT
     value += policy["indirect_wealth_map"][target.id] * saved_turns * INDIRECT_VALUE_SCALE * 0.35
-    return value * REINFORCE_VALUE_MULT
+    heuristic_value = value * REINFORCE_VALUE_MULT
+
+    global _value_network
+    if _value_network is not None:
+        try:
+            modes = build_modes(world)
+            learned_value = _value_network.predict_value(
+                world, target, "reinforce", hold_until, policy, modes,
+            )
+            learned_scaled = learned_value * max(1.0, heuristic_value)
+            blended = _value_network.blend_value(learned_scaled, heuristic_value)
+            _pending_experiences.append(
+                (world, target, "reinforce", hold_until, policy, modes, heuristic_value)
+            )
+            return max(0.0, blended)
+        except Exception:
+            pass
+
+    return heuristic_value
 
 
 def preferred_send(target, base_needed, arrival_turns, src_available, world, modes, policy):
@@ -2099,6 +2182,7 @@ def _try_beam_commit(mission, state, world, policy, modes, base_commitments,
 
         # ETA check
         ordered = sorted(mission.options, key=lambda o: (o.turns, -limits[o.src_id]))
+        ordered_with_limits = [(o, limits[o.src_id]) for o in ordered]
         turns_list = [world.plan_shot(o.src_id, target.id, limits[o.src_id])[1]
                       for o in ordered
                       if world.plan_shot(o.src_id, target.id, limits[o.src_id]) is not None]
@@ -2115,8 +2199,8 @@ def _try_beam_commit(mission, state, world, policy, modes, base_commitments,
 
         # Proportionally allocate ships among sources
         remaining = need
-        for idx, (option, limit) in enumerate(ordered):
-            rest = sum(l for _, l in ordered[idx + 1:])
+        for idx, (option, limit) in enumerate(ordered_with_limits):
+            rest = sum(l for _, l in ordered_with_limits[idx + 1:])
             send = min(limit, max(0, remaining - rest))
             remaining -= send
             new_spent[option.src_id] += send
@@ -2124,7 +2208,7 @@ def _try_beam_commit(mission, state, world, policy, modes, base_commitments,
             return None
 
         actual_turns = max(turns_list)
-        for option, _ in ordered:
+        for option, _ in ordered_with_limits:
             send = limits[option.src_id]
             if send > 0:
                 new_commits[target.id].append((actual_turns, world.player, send))
@@ -2342,6 +2426,16 @@ def plan_moves(world, deadline=None):
     modes = build_modes(world)
     policy = build_policy_state(world, deadline=deadline)
     planned_commitments = defaultdict(list)
+
+    # ── Inject opponent-model-predicted enemy arrivals into planned_commitments
+    predicted_enemy = policy.get("predicted_enemy_arrivals", {})
+    if predicted_enemy:
+        for target_id, arrivals in predicted_enemy.items():
+            for eta, owner, ships in arrivals:
+                planned_commitments[target_id].append(
+                    (int(math.ceil(eta)), owner, int(ships))
+                )
+
     source_options_by_target = defaultdict(list)
     missions = []
     moves = []
@@ -3078,14 +3172,70 @@ def build_world(obs):
 
 def compute_strategic_moves(obs, config=None):
     """Core strategic agent: build world model and plan moves."""
+    global _pending_experiences
+    _pending_experiences = []
+
     start_time = time.perf_counter()
     world = build_world(obs)
     if not world.my_planets:
         return []
+
+    # Record observation for opponent modeling
+    global _opponent_model
+    if _opponent_model is not None:
+        _opponent_model.record_observation(obs)
+
     act_timeout = _read(config, "actTimeout", 1.0) if config is not None else 1.0
     soft_budget = min(SOFT_ACT_DEADLINE, max(0.55, act_timeout * 0.82))
     deadline = start_time + soft_budget
-    return plan_moves(world, deadline=deadline)
+    moves = plan_moves(world, deadline=deadline)
+
+    # ── Record experiences for value network training ───────────────────
+    global _value_network
+    if _value_network is not None and _pending_experiences:
+        for (w, tgt, mtype, turns, pol, mod, hval) in _pending_experiences:
+            _value_network.record_experience(
+                w, tgt, mtype, turns, pol, mod, hval,
+            )
+
+    # ── Record our own moves for opponent model context ──────────────────
+    if _opponent_model is not None and moves:
+        try:
+            for move in moves:
+                src_id, angle, ships = move
+                if ships < 2:
+                    continue
+                # Estimate which target the fleet is heading towards
+                src = world.planet_by_id.get(src_id)
+                if src is None:
+                    continue
+                best_tgt = None
+                best_dot = -2.0
+                for target in world.planets:
+                    if target.id == src_id:
+                        continue
+                    dx = target.x - src.x
+                    dy = target.y - src.y
+                    d = math.hypot(dx, dy)
+                    if d < 0.1:
+                        continue
+                    tgt_angle = math.atan2(dy, dx)
+                    angle_diff = abs(tgt_angle - angle)
+                    if angle_diff > math.pi:
+                        angle_diff = 2 * math.pi - angle_diff
+                    # Cosine similarity
+                    dot = math.cos(angle_diff)
+                    if dot > best_dot and dot > 0.7:
+                        best_dot = dot
+                        best_tgt = target.id
+                if best_tgt is not None:
+                    _opponent_model.record_enemy_action(
+                        obs, [(src_id, best_tgt, int(ships))], world,
+                    )
+        except Exception:
+            pass
+
+    return moves
 
 
 # ============================================================
@@ -3093,13 +3243,30 @@ def compute_strategic_moves(obs, config=None):
 # ============================================================
 
 class StrategicAgent(BaseAgent):
-    """WorldModel-based strategic agent for Orbit Wars."""
+    """WorldModel-based strategic agent with opponent modeling and learned value network.
 
-    def __init__(self, player_id: int = 0):
+    Each instance owns its own model copies to support self-play training:
+      - Main agent (enable_learning=True): owns trainable models, pushes them to
+        module globals during act() so planning functions can access them.
+      - Opponent agent (enable_learning=False): owns frozen copies loaded from a
+        previous checkpoint. Models are pushed to globals during its turn but never
+        trained.
+    """
+
+    def __init__(self, player_id: int = 0, enable_learning: bool = True):
         super().__init__(player_id)
         self.name = "StrategicAgent"
+        self.enable_learning = enable_learning
+
+        # Each instance owns its own model copies
+        self._opponent_model = OpponentModel(player_id=player_id)
+        self._value_network = ValueNetwork()
 
     def act(self, observation):
+        global _opponent_model, _value_network
+        # Push instance models to module globals so planning functions use them
+        _opponent_model = self._opponent_model
+        _value_network = self._value_network
         try:
             return compute_strategic_moves(observation, None)
         except Exception:
@@ -3109,11 +3276,58 @@ class StrategicAgent(BaseAgent):
             return []
 
     def reset(self):
-        pass
+        self._opponent_model.reset()
+
+    def record_episode_outcome(self, won: bool):
+        """Called after an episode ends to update learned models (main agent only)."""
+        if not self.enable_learning:
+            return
+        self._value_network.record_episode_outcome(won)
+        self.train_models()
+
+    def train_models(self):
+        """Perform one training step for each learned model."""
+        if not self.enable_learning:
+            return
+        self._value_network.train()
+        self._opponent_model.train_online()
+
+    def save_weights(self, filepath: str):
+        """Save model weights to a file."""
+        import pickle
+        import os
+        weights = {
+            "value_network": self._value_network.get_weights(),
+            "opponent_model": self._opponent_model.get_weights(),
+        }
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+        with open(filepath, "wb") as f:
+            pickle.dump(weights, f)
+
+    def load_weights(self, filepath: str):
+        """Load model weights from a file into this instance."""
+        import pickle
+        try:
+            with open(filepath, "rb") as f:
+                weights = pickle.load(f)
+            if "value_network" in weights:
+                self._value_network.set_weights(weights["value_network"])
+            if "opponent_model" in weights:
+                self._opponent_model.set_weights(weights["opponent_model"])
+            return True
+        except FileNotFoundError:
+            return False
 
 
 # Global instance for Kaggle-compatible interface
 _agent_instance: Optional[StrategicAgent] = None
+
+# Shared learned models (persist across turns and episodes)
+_opponent_model: Optional[OpponentModel] = None
+_value_network: Optional[ValueNetwork] = None
+
+# Per-episode tracking
+_pending_experiences: list = []  # (world, target, mission_type, turns, policy, modes, heuristic_val)
 
 
 def strategic_agent(obs, config=None) -> list:
